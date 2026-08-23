@@ -187,11 +187,14 @@ write_host_launcher() {
 	local name="$1"
 	mkdir -p "$LOCAL_BIN"
 	local launcher="$LOCAL_BIN/$name"
+	# Calls through the stable ~/.local/bin/quick-distrobox-app symlink
+	# rather than this file's resolved repo path, so moving/reinstalling
+	# the repo (re-run install.sh) doesn't break already-exported apps.
 	cat > "$launcher" <<EOF
 #!/bin/sh
 # Managed by quick-distrobox-app — do not edit by hand, edit the app's
 # config instead (quick-distrobox-app list). Self-heals on every launch.
-exec "$SCRIPT_PATH" run "$name" -- "\$@"
+exec "$LOCAL_BIN/quick-distrobox-app" run "$name" -- "\$@"
 EOF
 	chmod +x "$launcher"
 }
