@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# quick-distrobox-app — acquire, export, and self-heal GUI apps installed
+# inside a distrobox container, exposed on the host as ordinary commands
+# and .desktop launchers.
+#
+# The generated host launcher for an app never changes: it just calls
+# `quick-distrobox-app run <name> -- "$@"`, and `run` always calls `ensure`
+# first. That means every launch is idempotently self-healing — if the
+# container was deleted, `ensure` recreates it and reinstalls the app
+# before exec'ing into it, with no separate repair step to remember to run.
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUNDLED_APPS_DIR="$REPO_ROOT/apps.d"
+BUNDLED_INSTALLERS_DIR="$REPO_ROOT/installers"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/quick-distrobox-app"
+USER_APPS_DIR="$CONFIG_HOME/apps"
+USER_INSTALLERS_DIR="$CONFIG_HOME/installers"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/quick-distrobox-app"
+LOCAL_BIN="$HOME/.local/bin"
+DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+
+DEFAULT_IMAGE='ubuntu:24.04'
+DEFAULT_CONTAINER='ubuntu-dev'
+
+log()  { echo "quick-distrobox-app: $*" >&2; }
+die()  { echo "quick-distrobox-app: error: $*" >&2; exit 1; }
+notify() {
+	log "$*"
+	command -v notify-send >/dev/null 2>&1 && notify-send -a quick-distrobox-app "quick-distrobox-app" "$*" 2>/dev/null || true
+}
+
+usage() {
+	cat <<'EOF'
+usage: quick-distrobox-app <command> [args]
+
+commands:
+  add <name> [--container NAME] [--distro IMAGE] --apt PKG | --script PATH
+                          Define a new app and immediately ensure+export it.
+  ensure <name>           Make sure <name>'s container, binary, host launcher
+                          and .desktop entry all exist — create/reinstall
+                          whatever is missing. Safe to run repeatedly.
+  ensure-all              ensure every known app (bundled + user-defined).
+  run <name> -- [args]    ensure <name>, then exec into the container and
+                          run it. This is what the generated host launcher
+                          calls; you can also run it directly.
+  list                    Show every known app and its current status.
+  remove <name> [--purge] Remove the host launcher/.desktop entry for <name>.
+                          --purge also uninstalls the binary from its
+                          container (never touches the container itself).
+  doctor                  Basic environment sanity checks.
+
+options for add:
+  --container NAME        distrobox container name (default: ubuntu-dev)
+  --distro IMAGE          distrobox image to create the container from if
+                           it doesn't exist yet (default: ubuntu:24.04) —
+                           any image usable with `distrobox create --image`
+  --bin PATH               path to the app's executable inside the container
+                           (default: /usr/bin/<name>)
+  --apt PKG                install via `apt-get install -y PKG`
+  --script PATH            install via running this script inside the
+                           container (mutually exclusive with --apt)
+  --desktop-name NAME       Name= shown in the app menu (default: <name>)
+  --comment TEXT            Comment= in the .desktop entry
+  --categories STR          Categories= in the .desktop entry
+
+examples:
+  quick-distrobox-app ensure claude-desktop
+  quick-distrobox-app add slack --apt slack-desktop
+  quick-distrobox-app add my-tool --container work-dev --distro fedora:41 \
+      --bin /usr/local/bin/my-tool --script ~/scripts/install-my-tool.sh
+EOF
+}
+
+# ---- config file loading -----------------------------------------------
+
+config_path_for() {
+	local name="$1"
+	if [[ -f "$USER_APPS_DIR/$name.conf" ]]; then
+		echo "$USER_APPS_DIR/$name.conf"
+	elif [[ -f "$BUNDLED_APPS_DIR/$name.conf" ]]; then
+		echo "$BUNDLED_APPS_DIR/$name.conf"
+	else
+		return 1
+	fi
+}
+
+# Populates: CONTAINER IMAGE BIN INSTALL_KIND INSTALL_SCRIPT APT_PACKAGE
+#            DESKTOP_NAME COMMENT CATEGORIES ICON_PATHS NEEDS_DBUS_FIX
+load_config() {
+	local name="$1" path
+	path=$(config_path_for "$name") || die "unknown app '$name' (no config in $USER_APPS_DIR or $BUNDLED_APPS_DIR — see 'add')"
+
+	CONTAINER=''; IMAGE=''; BIN=''; INSTALL_KIND=''; INSTALL_SCRIPT=''
+	APT_PACKAGE=''; DESKTOP_NAME=''; COMMENT=''; CATEGORIES=''
+	ICON_PATHS=''; NEEDS_DBUS_FIX=''
+	# shellcheck disable=SC1090
+	source "$path"
+
+	CONTAINER="${CONTAINER:-$DEFAULT_CONTAINER}"
+	IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
+	BIN="${BIN:-/usr/bin/$name}"
+	DESKTOP_NAME="${DESKTOP_NAME:-$name}"
+	CATEGORIES="${CATEGORIES:-Utility;}"
+	APP_CONFIG_PATH="$path"
+}
+
+list_all_apps() {
+	{
+		[[ -d $BUNDLED_APPS_DIR ]] && find "$BUNDLED_APPS_DIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null
+		[[ -d $USER_APPS_DIR ]] && find "$USER_APPS_DIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null
+	} | sed 's/\.conf$//' | sort -u
+}
+
+# ---- container / binary management --------------------------------------
+
+container_exists() {
+	distrobox list --no-color 2>/dev/null | awk -F'|' 'NR>1{gsub(/^ +| +$/,"",$2); print $2}' | grep -qxF "$1"
+}
+
+ensure_container() {
+	local container="$1" image="$2"
+	if container_exists "$container"; then
+		return 0
+	fi
+	notify "Creating distrobox container '$container' from $image (first run — this can take a few minutes) ..."
+	distrobox create --yes --name "$container" --image "$image" \
+		|| die "failed to create container '$container' from image '$image'"
+}
+
+binary_present() {
+	local container="$1" bin="$2"
+	distrobox enter "$container" -- test -x "$bin" >/dev/null 2>&1
+}
+
+resolve_install_script() {
+	local script="$1"
+	if [[ $script == /* ]]; then
+		echo "$script"
+	elif [[ -f "$USER_INSTALLERS_DIR/$script" ]]; then
+		echo "$USER_INSTALLERS_DIR/$script"
+	elif [[ -f "$BUNDLED_INSTALLERS_DIR/$script" ]]; then
+		echo "$BUNDLED_INSTALLERS_DIR/$script"
+	else
+		die "install script '$script' not found (looked in $USER_INSTALLERS_DIR and $BUNDLED_INSTALLERS_DIR)"
+	fi
+}
+
+ensure_binary() {
+	local name="$1"
+	if binary_present "$CONTAINER" "$BIN"; then
+		return 0
+	fi
+
+	notify "Installing $name into '$CONTAINER' ..."
+	case "$INSTALL_KIND" in
+		apt)
+			[[ -n $APT_PACKAGE ]] || die "app '$name' has INSTALL_KIND=apt but no APT_PACKAGE set"
+			distrobox enter "$CONTAINER" -- sudo bash -c \
+				"apt-get update -qq && apt-get install -y $APT_PACKAGE" \
+				|| die "apt install of '$APT_PACKAGE' failed in '$CONTAINER'"
+			;;
+		script)
+			[[ -n $INSTALL_SCRIPT ]] || die "app '$name' has INSTALL_KIND=script but no INSTALL_SCRIPT set"
+			local script_path
+			script_path=$(resolve_install_script "$INSTALL_SCRIPT")
+			distrobox enter "$CONTAINER" -- bash "$script_path" \
+				|| die "install script '$script_path' failed in '$CONTAINER'"
+			;;
+		*)
+			die "app '$name' has no usable INSTALL_KIND (expected 'apt' or 'script', got '${INSTALL_KIND:-<empty>}')"
+			;;
+	esac
+
+	binary_present "$CONTAINER" "$BIN" \
+		|| die "install for '$name' finished but '$BIN' still isn't present/executable in '$CONTAINER' — check BIN in $APP_CONFIG_PATH"
+	notify "$name installed."
+}
+
+# ---- host-side launcher / desktop entry ----------------------------------
+
+write_host_launcher() {
+	local name="$1"
+	mkdir -p "$LOCAL_BIN"
+	local launcher="$LOCAL_BIN/$name"
+	cat > "$launcher" <<EOF
+#!/bin/sh
+# Managed by quick-distrobox-app — do not edit by hand, edit the app's
+# config instead (quick-distrobox-app list). Self-heals on every launch.
+exec "$SCRIPT_PATH" run "$name" -- "\$@"
+EOF
+	chmod +x "$launcher"
+}
+
+# Best-effort: pull an icon out of the container so the app menu entry
+# doesn't fall back to a generic icon. Never fatal.
+export_icon() {
+	local name="$1"
+	[[ -n $ICON_PATHS ]] || { echo ''; return; }
+	mkdir -p "$ICON_DIR"
+	local dest="$ICON_DIR/$name.png"
+	local p
+	for p in $ICON_PATHS; do
+		if distrobox enter "$CONTAINER" -- test -f "$p" >/dev/null 2>&1; then
+			if distrobox enter "$CONTAINER" -- cat "$p" > "$dest" 2>/dev/null && [[ -s $dest ]]; then
+				echo "$name"
+				return
+			fi
+		fi
+	done
+	rm -f "$dest"
+	echo ''
+}
+
+write_desktop_entry() {
+	local name="$1"
+	mkdir -p "$DESKTOP_DIR"
+	local icon
+	icon=$(export_icon "$name")
+	[[ -n $icon ]] || icon="applications-other"
+	cat > "$DESKTOP_DIR/$name.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$DESKTOP_NAME
+Comment=$COMMENT
+Exec=$LOCAL_BIN/$name %U
+Icon=$icon
+Terminal=false
+Categories=$CATEGORIES
+EOF
+	command -v update-desktop-database >/dev/null 2>&1 \
+		&& update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+}
+
+# ---- commands -------------------------------------------------------------
+
+cmd_ensure() {
+	local name="${1:?usage: quick-distrobox-app ensure <name>}"
+	load_config "$name"
+	ensure_container "$CONTAINER" "$IMAGE"
+	ensure_binary "$name"
+	write_host_launcher "$name"
+	write_desktop_entry "$name"
+}
+
+cmd_ensure_all() {
+	local name any=0
+	while read -r name; do
+		[[ -n $name ]] || continue
+		any=1
+		log "ensuring $name ..."
+		cmd_ensure "$name"
+	done < <(list_all_apps)
+	[[ $any -eq 1 ]] || log "no apps defined yet — see 'quick-distrobox-app add --help'"
+}
+
+cmd_run() {
+	local name="${1:?usage: quick-distrobox-app run <name> -- [args]}"
+	shift
+	[[ "${1:-}" == "--" ]] && shift
+	cmd_ensure "$name"
+
+	# distrobox mounts the host root at /run/host but does not forward the
+	# host system D-Bus socket by default; Electron apps that want
+	# power/suspend/network signals need this pointed at the host bus.
+	if [[ ${NEEDS_DBUS_FIX:-0} == 1 ]]; then
+		export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/run/host/run/dbus/system_bus_socket}"
+	fi
+
+	exec distrobox-enter -n "$CONTAINER" -- "$BIN" "$@"
+}
+
+cmd_add() {
+	local name="${1:?usage: quick-distrobox-app add <name> [options]}"
+	shift
+	local container="$DEFAULT_CONTAINER" image="$DEFAULT_IMAGE" bin='' \
+		apt_pkg='' script='' desktop_name='' comment='' categories=''
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--container) container="$2"; shift 2 ;;
+			--distro) image="$2"; shift 2 ;;
+			--bin) bin="$2"; shift 2 ;;
+			--apt) apt_pkg="$2"; shift 2 ;;
+			--script) script="$(readlink -f "$2")"; shift 2 ;;
+			--desktop-name) desktop_name="$2"; shift 2 ;;
+			--comment) comment="$2"; shift 2 ;;
+			--categories) categories="$2"; shift 2 ;;
+			*) die "unknown option '$1' for add (see 'quick-distrobox-app --help')" ;;
+		esac
+	done
+
+	if [[ -n $apt_pkg && -n $script ]]; then
+		die "pass only one of --apt or --script"
+	elif [[ -z $apt_pkg && -z $script ]]; then
+		die "add needs an install method: --apt PKG or --script PATH"
+	fi
+
+	mkdir -p "$USER_APPS_DIR"
+	local conf="$USER_APPS_DIR/$name.conf"
+	{
+		echo "CONTAINER=${container@Q}"
+		echo "IMAGE=${image@Q}"
+		[[ -n $bin ]] && echo "BIN=${bin@Q}"
+		if [[ -n $apt_pkg ]]; then
+			echo "INSTALL_KIND=apt"
+			echo "APT_PACKAGE=${apt_pkg@Q}"
+		else
+			echo "INSTALL_KIND=script"
+			echo "INSTALL_SCRIPT=${script@Q}"
+		fi
+		[[ -n $desktop_name ]] && echo "DESKTOP_NAME=${desktop_name@Q}"
+		[[ -n $comment ]] && echo "COMMENT=${comment@Q}"
+		[[ -n $categories ]] && echo "CATEGORIES=${categories@Q}"
+	} > "$conf"
+	log "wrote $conf"
+
+	cmd_ensure "$name"
+}
+
+cmd_list() {
+	local name
+	printf '%-20s %-14s %-24s %-9s %-9s\n' NAME CONTAINER IMAGE INSTALLED EXPORTED
+	while read -r name; do
+		[[ -n $name ]] || continue
+		load_config "$name"
+		local installed="no" exported="no"
+		if container_exists "$CONTAINER" && binary_present "$CONTAINER" "$BIN"; then
+			installed="yes"
+		fi
+		[[ -x "$LOCAL_BIN/$name" ]] && exported="yes"
+		printf '%-20s %-14s %-24s %-9s %-9s\n' "$name" "$CONTAINER" "$IMAGE" "$installed" "$exported"
+	done < <(list_all_apps)
+}
+
+cmd_remove() {
+	local name="${1:?usage: quick-distrobox-app remove <name> [--purge]}"
+	shift
+	local purge=0
+	[[ "${1:-}" == "--purge" ]] && purge=1
+
+	rm -f "$LOCAL_BIN/$name" "$DESKTOP_DIR/$name.desktop" "$ICON_DIR/$name.png"
+	log "removed host launcher and .desktop entry for '$name'"
+
+	if [[ $purge -eq 1 ]]; then
+		load_config "$name" 2>/dev/null || { log "no config for '$name', nothing to purge"; return; }
+		if container_exists "$CONTAINER"; then
+			log "purging binary for '$name' from '$CONTAINER' is app-specific and not automated — remove it manually if needed"
+		fi
+	fi
+}
+
+cmd_doctor() {
+	local ok=1
+	if command -v distrobox >/dev/null 2>&1; then
+		log "distrobox: OK ($(distrobox version 2>&1))"
+	else
+		log "distrobox: MISSING"; ok=0
+	fi
+	if command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+		log "container backend: OK"
+	else
+		log "container backend: MISSING (need podman or docker)"; ok=0
+	fi
+	case ":$PATH:" in
+		*":$LOCAL_BIN:"*) log "$LOCAL_BIN on PATH: OK" ;;
+		*) log "$LOCAL_BIN on PATH: NO — add it to your shell profile"; ok=0 ;;
+	esac
+	log "config dir: $CONFIG_HOME"
+	log "cache dir: $CACHE_HOME"
+	if [[ $ok -eq 1 ]]; then
+		log "all checks passed"
+	else
+		die "one or more checks failed"
+	fi
+}
+
+main() {
+	local cmd="${1:-}"
+	[[ -n $cmd ]] || { usage; exit 1; }
+	shift || true
+	case "$cmd" in
+		add) cmd_add "$@" ;;
+		ensure) cmd_ensure "$@" ;;
+		ensure-all) cmd_ensure_all "$@" ;;
+		run) cmd_run "$@" ;;
+		list) cmd_list "$@" ;;
+		remove) cmd_remove "$@" ;;
+		doctor) cmd_doctor "$@" ;;
+		-h|--help|help) usage ;;
+		*) die "unknown command '$cmd' (see --help)" ;;
+	esac
+}
+
+main "$@"
